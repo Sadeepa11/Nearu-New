@@ -1,0 +1,40 @@
+# Full API Checkup: `/profile/circles/${circleId}/location`
+
+I have performed a codebase-wide checkup of all occurrences of the circle location update API.
+
+## Summary of Findings
+
+The API is strictly invoked in **two specific locations** within the codebase, both of which are now standardized to a **30-second frequency**.
+
+| File | Context | Frequency | Trigger |
+| :--- | :--- | :--- | :--- |
+| [app/screens/MapScreen.tsx](file:///d:/360app/app/screens/MapScreen.tsx) | Foreground Tracking | Fixed 30s | `Location.watchPositionAsync` |
+| [services/BackgroundLocationService.ts](file:///d:/360app/services/BackgroundLocationService.ts) | Background Service | Fixed 30s | `BackgroundService` (Android) / `TaskManager` (iOS) |
+
+---
+
+## Detailed Call Checkup
+
+### 1. [app/screens/MapScreen.tsx](file:///d:/360app/app/screens/MapScreen.tsx)
+- **Function:** [maybePostCircleLocationUpdate](file:///d:/360app/app/screens/MapScreen.tsx#556-608)
+- **Call Frequency:** strictly every **30 seconds**.
+- **Conditions for call:**
+    - Must have an active `circleId` selected.
+    - `user_location_sharing_enabled` must be `true` in `AsyncStorage`.
+    - Geographic coordinates must be valid finite numbers.
+- **Recent Standardizations:**
+    - Removed **20-meter distance filter** (previously skipped updates if the user didn't move).
+    - Removed **Journey Logic** (previously caused bursts or status updates after 5-minute gaps).
+
+### 2. [services/BackgroundLocationService.ts](file:///d:/360app/services/BackgroundLocationService.ts)
+- **Function:** [syncLocationQueue](file:///d:/360app/services/BackgroundLocationService.ts#49-104) (called via [backgroundTask](file:///d:/360app/services/BackgroundLocationService.ts#117-165) on Android and `TaskManager` on iOS).
+- **Call Frequency:** strictly every **30 seconds**.
+- **Conditions for call:**
+    - Must have a `lastSelectedCircleId` in `AsyncStorage`.
+    - **Internet Connectivity:** If offline, locations are queued and synced later via the same API.
+    - **Platform Handling:**
+        - **Android:** Managed via `react-native-background-actions` with a 30s heartbeat.
+        - **iOS:** Managed via `expo-task-manager` with `timeInterval: 30000`.
+
+## Verdict
+The codebase is now fully synchronized to a **strict 30-second heartbeat** for location updates. There are no other hidden calls or intermittent triggers for this specific API.
