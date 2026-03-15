@@ -11,19 +11,13 @@ export interface LocationPoint {
 export interface CircleData {
   id: number | string;
   name?: string;
-<<<<<<< HEAD
   code?: string;
   invitationCode?: string;
-=======
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
   Locations?: LocationPoint[];
   metadata?: { radius?: number };
   creatorId?: string;
   creator?: { id: string; name?: string };
-<<<<<<< HEAD
   notificationSettings?: any;
-=======
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
 }
 
 export interface UserLocation {
@@ -32,7 +26,6 @@ export interface UserLocation {
   heading?: number;
   accuracy?: number | null;
   speed?: number | null;
-<<<<<<< HEAD
   battery?: string | null;
   updatedAt?: string | null;
 }
@@ -50,16 +43,11 @@ export interface Journey {
   startTime: string;
   endTime: string;
   history: JourneyHistoryPoint[];
-=======
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
 }
 
 export interface CircleMember {
   id?: IdLike;
-<<<<<<< HEAD
   userId?: IdLike;
-=======
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
   name?: string;
   email?: string;
   avatar?: string | null;
@@ -73,10 +61,8 @@ export interface CircleMember {
     updatedAt: string;
   } | null;
   todayLocationHistory?: LocationHistoryEntry[];
-<<<<<<< HEAD
   journeys?: Journey[];
-=======
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
+
   Membership?: {
     nickname?: string;
     role?: string;
@@ -114,12 +100,8 @@ export interface AssignedLocationDetails {
 }
 
 export interface BatteryLevelInfo {
-<<<<<<< HEAD
   // level?: number | null;
   batteryLevel?: number | null;
-=======
-  level?: number | null;
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
   deviceId?: string | null;
   updatedAt?: string | null;
 }
@@ -133,7 +115,6 @@ export interface LocationHistoryEntry {
   circleId?: string | null;
 }
 
-<<<<<<< HEAD
 
 export interface AppNotification {
   id: string;
@@ -166,8 +147,7 @@ export interface NotificationPagination {
   totalPages: number;
 }
 
-=======
->>>>>>> f0b03e3a15351244bc199bd0c4d14d0c39915ba4
+
 export type LocationHistoryFilterKey = "today" | "yesterday" | "this_week" | "this_month" | "custom";
 
 export type MapType = "standard" | "satellite" | "hybrid" | "terrain";

@@ -3,6 +3,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 export interface StoredCoordinateSnapshot {
   latitude: number;
   longitude: number;
+  speed: number | null;
   timestamp: number;
 }
 
@@ -11,10 +12,12 @@ const LAST_KNOWN_LOCATION_STORAGE_KEY = "app:lastKnownLocation";
 export const storeLastKnownLocation = async (coords: {
   latitude: number;
   longitude: number;
+  speed?: number | null;
 }): Promise<void> => {
   const snapshot: StoredCoordinateSnapshot = {
     latitude: Number(coords.latitude),
     longitude: Number(coords.longitude),
+    speed: coords.speed !== undefined ? coords.speed : null,
     timestamp: Date.now(),
   };
 
@@ -44,6 +47,7 @@ export const readLastKnownLocation = async (): Promise<StoredCoordinateSnapshot 
       return {
         latitude: Number(parsed.latitude),
         longitude: Number(parsed.longitude),
+        speed: typeof parsed.speed === "number" ? parsed.speed : null,
         timestamp: typeof parsed.timestamp === "number" ? parsed.timestamp : Date.now(),
       };
     }

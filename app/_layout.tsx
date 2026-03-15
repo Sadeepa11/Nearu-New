@@ -20,6 +20,7 @@ import { useState } from "react";
 import { NotificationToast } from "../components/NotificationToast";
 import { NotificationItem, NotificationService } from "../services/NotificationService";
 import { AlertProvider } from "./context/AlertContext";
+import { SpeedProvider } from "./context/SpeedContext";
 
 
 export default function RootLayout() {
@@ -106,21 +107,22 @@ export default function RootLayout() {
   }, [router]);
 
   return (
-
     <GestureHandlerRootView style={{ flex: 1 }}>
       <AlertProvider>
-        <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
-          <Slot />
-          <NotificationToast
-            visible={toastVisible}
-            notification={currentNotification}
-            onPress={() => {
-              setToastVisible(false);
-            }}
-            onClose={() => setToastVisible(false)}
-          />
-          <StatusBar style="auto" />
-        </ThemeProvider>
+        <SpeedProvider>
+          <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
+            <Slot />
+            <NotificationToast
+              visible={toastVisible}
+              notification={currentNotification}
+              onPress={() => {
+                setToastVisible(false);
+              }}
+              onClose={() => setToastVisible(false)}
+            />
+            <StatusBar style="auto" />
+          </ThemeProvider>
+        </SpeedProvider>
       </AlertProvider>
     </GestureHandlerRootView>
   );
