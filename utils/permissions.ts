@@ -9,7 +9,6 @@ const API_BASE_URL = "https://api.medi.lk/api";
 // const API_BASE_URL = "https://nearu.servefamily.com/api";
 // const API_BASE_URL = "https://nearu.kalametiyaseafoodrestaurant.com/api";
 
-// const API_BASE_URL = "https://api.medi.lk/api";
 // const API_BASE_URL = "https://nearu.servefamily.com/api";
 
 // export const API_BASE_URL = "https://nearu.kalametiyaseafoodrestaurant.com/api";

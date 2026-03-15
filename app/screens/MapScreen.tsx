@@ -31,6 +31,7 @@ import MapView, { Circle, Marker, Polyline, UrlTile } from "react-native-maps";
 
 import { isBackgroundLocationRunning, startBackgroundLocation, stopBackgroundLocation } from "../../services/BackgroundLocationService";
 import { useAlert } from "../context/AlertContext";
+import { useSpeed } from "../context/SpeedContext";
 
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import DateTimePicker from "@react-native-community/datetimepicker";
@@ -594,15 +595,18 @@ const maybePostCircleLocationUpdate = async (
     return { success: true, name: "Throttled" };
   }
 
-  // Strictly check that the app is active (in the foreground).
+  // Allow 'active' and 'inactive' (iOS partially covered).
   // Background updates should be handled solely by BackgroundLocationService.ts
-  if (AppState.currentState !== 'active') {
-    console.log("App is not active (in foreground). Skipping MapScreen sync to let background service handle it.");
+  if (AppState.currentState === 'background') {
+    console.log("App is in background. Skipping MapScreen sync to let background service handle it.");
     return { success: false, name: "Background" };
   }
 
   // Fetch real location name
   const realLocationName = await getLocationNameFromOSM(latitude, longitude);
+
+  // Check drive detection setting
+  const isDriveDetectionEnabled = (await AsyncStorage.getItem("user_drive_detection_enabled")) === "true";
 
   const response = await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
     method: "POST",
@@ -613,13 +617,10 @@ const maybePostCircleLocationUpdate = async (
     body: JSON.stringify({
       latitude,
       longitude,
-      name: realLocationName, // Use the fetched name
-      metadata: JSON.stringify({
-        accuracy: coords.accuracy ?? null,
-        speed: coords.speed ?? null,
-        timestamp: Date.now(),
-        ...(coords.status ? { status: coords.status } : {}),
-      }),
+      name: realLocationName,
+      metadata: {
+        speed: isDriveDetectionEnabled ? String(coords.speed) : "0"
+      },
     }),
   });
 
@@ -2339,7 +2340,7 @@ const MapScreen: React.FC = () => {
     name: null,
   });
 
-  const [currentSpeed, setCurrentSpeed] = useState<number | null>(null);
+  const { currentSpeed, setCurrentSpeed } = useSpeed();
 
   // Circles Modal Share State
 
@@ -2407,6 +2408,18 @@ const MapScreen: React.FC = () => {
       }
     };
     loadStoredUser();
+  }, []);
+
+  useEffect(() => {
+    const loadDriveDetectionSetting = async () => {
+      try {
+        const val = await AsyncStorage.getItem("user_drive_detection_enabled");
+        setDriveDetectionEnabled(val === "true");
+      } catch (e) {
+        console.warn("Failed to load drive detection setting", e);
+      }
+    };
+    loadDriveDetectionSetting();
   }, []);
 
   // Handle AppState to start/stop background location
@@ -3300,6 +3313,29 @@ const MapScreen: React.FC = () => {
     [currentUserId, fetchCircleMembers]
   );
 
+  const fetchCircleLocations = useCallback(async (circleId: number | string | undefined) => {
+    if (!circleId) return;
+    const cid = String(circleId);
+    try {
+      const response = await authenticatedFetch(`${API_BASE_URL}/circles/${cid}/locations`, {
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return;
+
+      const payload = await response.json();
+      const locations = payload?.data || payload?.locations || [];
+
+      setSelectedCircle(prev => {
+        if (prev && String(prev.id) === cid) {
+          return { ...prev, Locations: locations };
+        }
+        return prev;
+      });
+    } catch (e) {
+      console.warn("Failed to fetch circle locations:", e);
+    }
+  }, []);
+
   const handleSelectCircle = useCallback(
     (circleId: number | string, circleList?: CircleData[]) => {
       selectCircle(circleId, circleList);
@@ -3741,11 +3777,18 @@ const MapScreen: React.FC = () => {
         setStartupStatus("Loading your data...");
 
         // Helper to wrap promise and update progress
-        async function wrapProgress<T>(promise: Promise<T>, increment: number): Promise<T> {
+        // async function wrapProgress<T>(promise: Promise<T>, increment: number): Promise<T> {
+        //   const result = await promise;
+        //   setStartupProgress(prev => Math.min(0.95, prev + increment));
+        //   return result;
+        // }
+
+
+        const wrapProgress = async <T,>(promise: Promise<T>, increment: number): Promise<T> => {
           const result = await promise;
           setStartupProgress(prev => Math.min(0.95, prev + increment));
           return result;
-        }
+        };
 
         await Promise.all([
           wrapProgress(sendBatteryLevel().catch(e => console.warn("Failed to sync battery", e)), 0.15),
@@ -3871,7 +3914,7 @@ const MapScreen: React.FC = () => {
 
         const config = {
           accuracy: Location.Accuracy.High,
-          timeInterval: 30000, // Fixed 30 seconds
+          timeInterval: 5000, // 5 seconds for real-time performance
         };
 
         const subscription = await Location.watchPositionAsync(
@@ -3890,7 +3933,9 @@ const MapScreen: React.FC = () => {
               accuracy: Number.isFinite(position.coords.accuracy) ? position.coords.accuracy ?? null : null,
             };
 
-            setCurrentSpeed(position.coords.speed ?? 0);
+            const rawSpeed = position.coords.speed ?? 0;
+            const kmphSpeed = rawSpeed;
+            setCurrentSpeed(kmphSpeed);
 
             // Process location update immediately for connected circle
             if (activeCircleIdRef.current) {
@@ -3898,14 +3943,14 @@ const MapScreen: React.FC = () => {
                 latitude,
                 longitude,
                 accuracy: position.coords.accuracy ?? null,
-                speed: position.coords.speed ?? null,
+                speed: position.coords.speed !== null ? position.coords.speed : null,   //Test Case 4
               }).then((result) => {
                 // Show auto-closing coordinate alert with full details
                 setCoordinateAlert({
                   visible: true,
                   lat: latitude,
                   lng: longitude,
-                  speed: position.coords.speed ?? null,
+                  speed: position.coords.speed !== null ? position.coords.speed : null, // Store as kmph to match UI logic
                   accuracy: position.coords.accuracy ?? null,
                   name: result.name,
                 });
@@ -5892,7 +5937,7 @@ const MapScreen: React.FC = () => {
         displayName={displayName}
         avatarUrl={resolvedAvatar}
         batteryLevel={batteryValue}
-        speed={coordinate.speed ?? 0}
+        speed={isCurrentUser ? currentSpeed ?? 0 : coordinate.speed ?? 0}
         isCurrentUser={isCurrentUser}
         relation={(memberRecord as any)?.Membership?.metadata?.relation}
         onLongPress={() => !isCurrentUser && memberRecord && handleOpenMemberJourneysModal(memberRecord)}
@@ -7433,7 +7478,7 @@ const MapScreen: React.FC = () => {
                 </Text>
                 <Text style={styles.coordinateAlertDetail}>
                   Acc: {coordinateAlert.accuracy?.toFixed(1) || 'N/A'}m |
-                  Speed: {coordinateAlert.speed != null ? `${Math.round(coordinateAlert.speed * 3.6)} kmph` : '0 kmph'}
+                  Speed: {coordinateAlert.speed != null ? `${Math.round(coordinateAlert.speed)} kmph` : '0 kmph'}
                 </Text>
               </View>
             </View>
@@ -7441,14 +7486,16 @@ const MapScreen: React.FC = () => {
         )}
 
         {/* Persistent Speed indicator on left-mid */}
-        <View style={styles.leftMidSpeedContainer} pointerEvents="none">
-          <BlurView intensity={70} tint="light" style={StyleSheet.absoluteFill} />
-          <Ionicons name="speedometer-outline" size={16} color={COLORS.primary} />
-          <Text style={styles.currentSpeedText}>
-            {currentSpeed != null ? Math.round(currentSpeed) : 0}
-          </Text>
-          <Text style={styles.speedUnitText}>kmph</Text>
-        </View>
+        {driveDetectionEnabled && (
+          <View style={styles.leftMidSpeedContainer} pointerEvents="none">
+            <BlurView intensity={70} tint="light" style={StyleSheet.absoluteFill} />
+            <Ionicons name="speedometer-outline" size={16} color={COLORS.primary} />
+            <Text style={styles.currentSpeedText}>
+              {Math.round(currentSpeed ?? 0)}
+            </Text>
+            <Text style={styles.speedUnitText}>kmph</Text>
+          </View>
+        )}
 
         <CirclesModal
           isOpen={isCirclesModalOpen}
@@ -7478,7 +7525,9 @@ const MapScreen: React.FC = () => {
           currentUserBatteryLevel={currentUserBatteryLevel}
           memberAvatarUrls={memberAvatarUrls}
           onPlaceSaved={() => {
-            loadCircles(true);
+            if (selectedCircle?.id) {
+              fetchCircleLocations(selectedCircle.id);
+            }
             setIsAddPlaceModalOpen(false);
           }}
         />
