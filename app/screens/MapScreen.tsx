@@ -67,7 +67,7 @@ import {
   watchBatteryLevel
 } from "../../utils/battery";
 import { formatToSLTime } from "../../utils/dateHelpers";
-import { storeLastKnownLocation } from "../../utils/locationCache";
+import { storeLastKnownLocation, readLastKnownLocation } from "../../utils/locationCache";
 import { setNotificationReceptionEnabled } from "../../utils/notificationListeners";
 import { requestNotificationPermissions } from "../../utils/permissions";
 import NotificationIcon from "../components/icons/NotificationIcon";
@@ -533,15 +533,38 @@ const clearAllPostedLocations = async (): Promise<void> => {
 };
 
 
+const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
+  const R = 6371e3; // metres
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) *
+    Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+};
+
 const getLocationNameFromOSM = async (latitude: number, longitude: number): Promise<string> => {
   try {
     const url = `${NOMINATIM_BASE_URL}/reverse?format=json&lat=${latitude}&lon=${longitude}`;
+    
+    // Add 5s timeout to prevent stalling the reporter
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), 5000);
+
     const response = await fetch(url, {
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'NearuApp/1.0'
-      }
+      },
+      signal: controller.signal
     });
+    
+    clearTimeout(id);
     const data = await response.json();
 
     if (data && data.display_name) {
@@ -587,10 +610,10 @@ const maybePostCircleLocationUpdate = async (
     return { success: false, name: null };
   }
 
-  // Throttle updates to prevent duplicate calls (10-second window)
+  // Throttle updates to prevent duplicate calls (8-second window for 10s interval)
   const lastPosted = await getLastPostedLocationForCircle(circleId);
-  if (lastPosted && Date.now() - lastPosted.timestamp < 10000) {
-    console.log("Throttled: Skipping location update as it has been less than 10s.");
+  if (lastPosted && Date.now() - lastPosted.timestamp < 8000) {
+    console.log("Throttled: Skipping location update.");
     // Return mock success so the caller thinks it went through and won't aggressively retry
     return { success: true, name: "Throttled" };
   }
@@ -601,12 +624,35 @@ const maybePostCircleLocationUpdate = async (
   // Allow 'active' and 'inactive' (iOS partially covered).
   // Background updates should be handled solely by BackgroundLocationService.ts
   if (AppState.currentState === 'background') {
-    console.log("App is in background. Skipping MapScreen sync to let background service handle it.");
     return { success: false, name: "Background" };
   }
 
-  // Fetch real location name
-  const realLocationName = await getLocationNameFromOSM(latitude, longitude);
+  // OPTIMIZATION: Cache location names to prevent Nominatim rate-limiting/delays
+  let realLocationName = "Unknown Location";
+  try {
+    const lastGeoStr = await AsyncStorage.getItem(`last_geocoded_name_${circleId}`);
+    const lastGeoLat = await AsyncStorage.getItem(`last_geocoded_lat_${circleId}`);
+    const lastGeoLng = await AsyncStorage.getItem(`last_geocoded_lng_${circleId}`);
+    
+    let shouldFetch = true;
+    if (lastGeoStr && lastGeoLat && lastGeoLng) {
+      const gLat = parseFloat(lastGeoLat);
+      const gLng = parseFloat(lastGeoLng);
+      if (Math.abs(latitude - gLat) < 0.0005 && Math.abs(longitude - gLng) < 0.0005) {
+        shouldFetch = false;
+        realLocationName = lastGeoStr;
+      }
+    }
+
+    if (shouldFetch) {
+      realLocationName = await getLocationNameFromOSM(latitude, longitude);
+      await AsyncStorage.setItem(`last_geocoded_name_${circleId}`, realLocationName);
+      await AsyncStorage.setItem(`last_geocoded_lat_${circleId}`, latitude.toString());
+      await AsyncStorage.setItem(`last_geocoded_lng_${circleId}`, longitude.toString());
+    }
+  } catch (e) {
+    console.warn("Geocode cache error", e);
+  }
 
   // Check drive detection setting
   const isDriveDetectionEnabled = (await AsyncStorage.getItem("user_drive_detection_enabled")) === "true";
@@ -3920,6 +3966,58 @@ const MapScreen: React.FC = () => {
     };
   }, []);
 
+  // --- Simple 10s Foreground Reporting Loop ---
+  useEffect(() => {
+    let interval: any;
+
+    const syncLocationDirectly = async () => {
+      try {
+        const circleId = activeCircleIdRef.current;
+        const lastLoc = locationRef.current;
+        if (!circleId || !lastLoc) return;
+
+        // Fetch location name (with small cache logic or just OSM)
+        const locationName = await getLocationNameFromOSM(lastLoc.latitude, lastLoc.longitude);
+
+        const payload = {
+          latitude: lastLoc.latitude,
+          longitude: lastLoc.longitude,
+          name: locationName,
+          metadata: {
+            run: 'foreground',
+            time: formatToSLTime(new Date()),
+          },
+        };
+
+        await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            accept: "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+
+        // alert("API called: " + JSON.stringify(payload));
+        console.log("Simple 10s API sync successful");
+      } catch (err) {
+        console.warn("Simple 10s sync failed:", err);
+      }
+    };
+
+    // Immediate sync on mount
+    void syncLocationDirectly();
+
+    // Standard 10s interval
+    interval = setInterval(() => {
+      void syncLocationDirectly();
+    }, 10000);
+
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -3967,7 +4065,7 @@ const MapScreen: React.FC = () => {
 
             // Process location update immediately for connected circle
             if (activeCircleIdRef.current) {
-              processCircleLocationUpdate(activeCircleIdRef.current, {
+              maybePostCircleLocationUpdate(activeCircleIdRef.current, {
                 latitude,
                 longitude,
                 accuracy: position.coords.accuracy ?? null,
@@ -4026,7 +4124,11 @@ const MapScreen: React.FC = () => {
   }, []); // Remove dependency on driveDetectionEnabled to keep it fixed
 
   useEffect(() => {
-    activeCircleIdRef.current = selectedCircle?.id ? String(selectedCircle.id) : null;
+    const cid = selectedCircle?.id ? String(selectedCircle.id) : null;
+    activeCircleIdRef.current = cid;
+    if (cid) {
+      void AsyncStorage.setItem("mapScreen:lastSelectedCircleId", cid);
+    }
   }, [selectedCircle]);
 
   // 4. Update members when selection changes
@@ -7471,28 +7573,7 @@ const MapScreen: React.FC = () => {
           }}
         />
 
-        {/* Coordinate Alert Overlay */}
-        {coordinateAlert.visible && (
-          <View style={styles.coordinateAlertContainer}>
-            <BlurView intensity={80} tint="dark" style={StyleSheet.absoluteFill} />
-            <View style={styles.coordinateAlertContent}>
-              <Ionicons name="location" size={18} color="#FFF" style={{ marginRight: 8 }} />
-              <View>
-                <Text style={styles.coordinateAlertHeader}>Location Update Sent</Text>
-                <Text style={styles.coordinateAlertText}>
-                  Lat: {coordinateAlert.lat.toFixed(6)}, Lng: {coordinateAlert.lng.toFixed(6)}
-                </Text>
-                <Text style={styles.coordinateAlertDetail}>
-                  Name: {coordinateAlert.name || 'Resolving...'}
-                </Text>
-                <Text style={styles.coordinateAlertDetail}>
-                  Acc: {coordinateAlert.accuracy?.toFixed(1) || 'N/A'}m |
-                  Speed: {coordinateAlert.speed != null ? `${Math.round(coordinateAlert.speed)} kmph` : '0 kmph'}
-                </Text>
-              </View>
-            </View>
-          </View>
-        )}
+   
 
         {/* Persistent Speed indicator on left-mid */}
         {driveDetectionEnabled && (

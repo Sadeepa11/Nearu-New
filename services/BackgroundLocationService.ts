@@ -6,7 +6,7 @@ import { AppState, Platform } from 'react-native';
 import BackgroundService from 'react-native-background-actions';
 import { API_BASE_URL, authenticatedFetch } from '../utils/auth';
 import { formatToSLTime } from '../utils/dateHelpers';
-import { storeLastKnownLocation } from '../utils/locationCache';
+import { storeLastKnownLocation, readLastKnownLocation } from '../utils/locationCache';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-task';
 const LOCATION_QUEUE_KEY = 'location-sync-queue';
@@ -14,6 +14,71 @@ const LAST_BACKGROUND_SYNC_TIME = 'last-background-sync-time';
 export const LAST_FOREGROUND_HEARTBEAT = 'last-foreground-heartbeat';
 
 let isSyncInProgress = false;
+
+const NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org";
+
+const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
+    const R = 6371e3; // metres
+    const φ1 = lat1 * Math.PI / 180;
+    const φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180;
+    const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+    const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+        Math.cos(φ1) * Math.cos(φ2) *
+        Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    return R * c;
+};
+
+const getLocationNameFromOSM = async (latitude: number, longitude: number): Promise<string> => {
+    try {
+        const circleId = await AsyncStorage.getItem("mapScreen:lastSelectedCircleId");
+        if (!circleId) return "Background Update";
+
+        // OPTIMIZATION: Cache location names to prevent Nominatim rate-limiting/delays
+        const lastGeoStr = await AsyncStorage.getItem(`last_geocoded_name_${circleId}`);
+        const lastGeoLat = await AsyncStorage.getItem(`last_geocoded_lat_${circleId}`);
+        const lastGeoLng = await AsyncStorage.getItem(`last_geocoded_lng_${circleId}`);
+        
+        if (lastGeoStr && lastGeoLat && lastGeoLng) {
+            const gLat = parseFloat(lastGeoLat);
+            const gLng = parseFloat(lastGeoLng);
+            if (Math.abs(latitude - gLat) < 0.0005 && Math.abs(longitude - gLng) < 0.0005) {
+                return lastGeoStr;
+            }
+        }
+
+        const url = `${NOMINATIM_BASE_URL}/reverse?format=json&lat=${latitude}&lon=${longitude}`;
+        
+        // Add 5s timeout to prevent stalling the reporter
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), 5000);
+
+        const response = await fetch(url, {
+            headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'NearuApp/1.0'
+            },
+            signal: controller.signal
+        });
+        
+        clearTimeout(id);
+        const data = await response.json();
+
+        if (data && data.display_name) {
+            const name = data.display_name;
+            await AsyncStorage.setItem(`last_geocoded_name_${circleId}`, name);
+            await AsyncStorage.setItem(`last_geocoded_lat_${circleId}`, latitude.toString());
+            await AsyncStorage.setItem(`last_geocoded_lng_${circleId}`, longitude.toString());
+            return name;
+        }
+        return "Background Update";
+    } catch (error) {
+        return "Background Update";
+    }
+};
 
 // --- Type Definitions ---
 interface LocationData {
@@ -76,8 +141,9 @@ const isAppInForeground = async (): Promise<boolean> => {
         if (!lastHeartbeat) return false;
         
         const diff = Date.now() - parseInt(lastHeartbeat, 10);
-        // If the app sent a heartbeat in the last 15 seconds, consider it active
-        return diff < 15000;
+        // If the app sent a heartbeat in the last 12 seconds, consider it active
+        // This allows for a quicker hand-off to background tasks when app is closed.
+        return diff < 12000;
     } catch (e) {
         return false;
     }
@@ -98,7 +164,7 @@ export const syncLocationQueue = async () => {
     // 3. Throttle background syncs to 10 seconds
     const lastSyncStr = await AsyncStorage.getItem(LAST_BACKGROUND_SYNC_TIME);
     const lastSync = lastSyncStr ? parseInt(lastSyncStr, 10) : 0;
-    if (Date.now() - lastSync < 10000) {
+    if (Date.now() - lastSync < 8000) {
         return;
     }
 
@@ -125,9 +191,13 @@ export const syncLocationQueue = async () => {
         const remainingQueue: LocationData[] = [];
         await AsyncStorage.setItem(LAST_BACKGROUND_SYNC_TIME, Date.now().toString());
 
+
         for (const loc of queue) {
             try {
-                const response = await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
+                // Fetch location name (with small cache logic or just OSM)
+                const locationName = await getLocationNameFromOSM(loc.latitude, loc.longitude);
+
+                await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -136,17 +206,13 @@ export const syncLocationQueue = async () => {
                     body: JSON.stringify({
                         latitude: loc.latitude,
                         longitude: loc.longitude,
-                        name: "Background Update from front end",
+                        name: locationName,
                         metadata: {
                             run: 'background',
                             time: formatToSLTime(loc.timestamp),
-                        }
-                    })
+                        },
+                    }),
                 });
-
-                if (!response.ok) {
-                    remainingQueue.push(loc);
-                }
             } catch (error) {
                 remainingQueue.push(loc);
             }
@@ -167,7 +233,7 @@ export const syncLocationQueue = async () => {
 const sleep = (time: number) => new Promise<void>((resolve) => setTimeout(() => resolve(), time));
 
 const backgroundTask = async (taskDataArguments?: { delay: number }) => {
-    const delay = taskDataArguments?.delay || 5000;
+    const delay = taskDataArguments?.delay || 10000;
 
     await new Promise<void>(async (resolve) => {
         let subscription: Location.LocationSubscription | null = null;
@@ -214,8 +280,27 @@ const backgroundTask = async (taskDataArguments?: { delay: number }) => {
             );
 
             // Loop to keep service alive
+            // Loop to keep service alive and trigger periodic syncs
             while (BackgroundService.isRunning()) {
                 await sleep(10000);
+                
+                // Reliability: If queue is empty (stationary), grab last known to ensure 10s report
+                const queue = await getQueue();
+                if (queue.length === 0) {
+                    const lastKnown = await readLastKnownLocation();
+                    if (lastKnown) {
+                        await queueLocation({
+                            latitude: lastKnown.latitude,
+                            longitude: lastKnown.longitude,
+                            accuracy: 10,
+                            speed: lastKnown.speed || 0,
+                            timestamp: Date.now(),
+                        });
+                        void syncLocationQueue();
+                    }
+                } else {
+                    void syncLocationQueue();
+                }
             }
 
         } catch (e) {
@@ -238,6 +323,7 @@ const options = {
     },
     color: '#ff00ff',
     linkingURI: 'yourSchemeHere://chat/jane',
+    stopOnTerminate: false,
     parameters: {
         delay: 10000,
     },
