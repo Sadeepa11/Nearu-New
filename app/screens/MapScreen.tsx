@@ -29,7 +29,7 @@ import {
 
 import MapView, { Circle, Marker, Polyline, UrlTile } from "react-native-maps";
 
-import { isBackgroundLocationRunning, startBackgroundLocation, stopBackgroundLocation } from "../../services/BackgroundLocationService";
+import { isBackgroundLocationRunning, startBackgroundLocation, stopBackgroundLocation, LAST_FOREGROUND_HEARTBEAT } from "../../services/BackgroundLocationService";
 import { useAlert } from "../context/AlertContext";
 import { useSpeed } from "../context/SpeedContext";
 
@@ -587,13 +587,16 @@ const maybePostCircleLocationUpdate = async (
     return { success: false, name: null };
   }
 
-  // Throttle updates to prevent duplicate calls (5-second window)
+  // Throttle updates to prevent duplicate calls (10-second window)
   const lastPosted = await getLastPostedLocationForCircle(circleId);
-  if (lastPosted && Date.now() - lastPosted.timestamp < 5000) {
-    console.log("Throttled: Skipping location update as it has been less than 5s.");
+  if (lastPosted && Date.now() - lastPosted.timestamp < 10000) {
+    console.log("Throttled: Skipping location update as it has been less than 10s.");
     // Return mock success so the caller thinks it went through and won't aggressively retry
     return { success: true, name: "Throttled" };
   }
+
+  // Set the "last posted" timestamp IMMEDIATELY to prevent overlapping calls from passing the check
+  await setLastPostedLocationForCircle(circleId, { latitude, longitude });
 
   // Allow 'active' and 'inactive' (iOS partially covered).
   // Background updates should be handled solely by BackgroundLocationService.ts
@@ -619,7 +622,9 @@ const maybePostCircleLocationUpdate = async (
       longitude,
       name: realLocationName,
       metadata: {
-        speed: isDriveDetectionEnabled ? String(coords.speed) : "0"
+        run: 'foreground',
+        time: formatToSLTime(new Date()),
+        // speed: isDriveDetectionEnabled ? String(coords.speed) : "0"
       },
     }),
   });
@@ -629,7 +634,6 @@ const maybePostCircleLocationUpdate = async (
     throw new Error(payload?.message ?? "Failed to post location update.");
   }
 
-  await setLastPostedLocationForCircle(circleId, { latitude, longitude });
   return { success: true, name: realLocationName };
 };
 
@@ -3893,6 +3897,30 @@ const MapScreen: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    let interval: any;
+
+    const sendHeartbeat = async () => {
+      try {
+        await AsyncStorage.setItem(LAST_FOREGROUND_HEARTBEAT, Date.now().toString());
+      } catch (e) {
+        // Silent fail
+      }
+    };
+
+    // Send immediate heartbeat on mount
+    void sendHeartbeat();
+
+    // Send heartbeat every 10 seconds
+    interval = setInterval(() => {
+      void sendHeartbeat();
+    }, 10000);
+
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
 
     const ensureForegroundWatch = async () => {
@@ -3914,7 +3942,7 @@ const MapScreen: React.FC = () => {
 
         const config = {
           accuracy: Location.Accuracy.High,
-          timeInterval: 5000, // 5 seconds for real-time performance
+          timeInterval: 10000, // 10 seconds for standardized performance
         };
 
         const subscription = await Location.watchPositionAsync(
@@ -4215,26 +4243,7 @@ const MapScreen: React.FC = () => {
     });
   }, [currentUserAssignedLocationId, notificationsEnabled, showAlert]);
 
-  useEffect(() => {
-    if (!locationSharingEnabled || !selectedCircle || !location) {
-      return;
-    }
 
-    const circleId = normalizeIdentifier(selectedCircle.id);
-    if (!circleId) {
-      return;
-    }
-
-    void processCircleLocationUpdate(circleId, {
-      latitude: location.latitude,
-      longitude: location.longitude,
-      accuracy: location.accuracy ?? null,
-    }, currentLocations, {
-      onLocationsArrived: handleLocationArrivalAlerts,
-    }).catch((error) => {
-      console.warn("Location update failed", error);
-    });
-  }, [currentLocations, handleLocationArrivalAlerts, location, locationSharingEnabled, selectedCircle]);
 
   const assignedLocationDetails = useMemo<AssignedLocationDetails | null>(() => {
     if (!currentAssignedEntry) {

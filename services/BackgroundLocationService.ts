@@ -2,13 +2,18 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
-import { Platform } from 'react-native';
+import { AppState, Platform } from 'react-native';
 import BackgroundService from 'react-native-background-actions';
 import { API_BASE_URL, authenticatedFetch } from '../utils/auth';
+import { formatToSLTime } from '../utils/dateHelpers';
 import { storeLastKnownLocation } from '../utils/locationCache';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-task';
 const LOCATION_QUEUE_KEY = 'location-sync-queue';
+const LAST_BACKGROUND_SYNC_TIME = 'last-background-sync-time';
+export const LAST_FOREGROUND_HEARTBEAT = 'last-foreground-heartbeat';
+
+let isSyncInProgress = false;
 
 // --- Type Definitions ---
 interface LocationData {
@@ -41,66 +46,120 @@ const saveQueue = async (queue: LocationData[]) => {
 
 const queueLocation = async (location: LocationData) => {
     const queue = await getQueue();
+    
+    // 1. Prevent duplicate timestamps
+    if (queue.length > 0) {
+        const last = queue[queue.length - 1];
+        if (last.timestamp === location.timestamp) {
+            return;
+        }
+        
+        // 2. Strict 10s throttle for background collection
+        // This prevents bursts if the OS sends multiple locations at once
+        if (location.timestamp - last.timestamp < 10000) {
+            return;
+        }
+    }
+
     queue.push(location);
     await saveQueue(queue);
+};
+
+/**
+ * Robust check to see if the app is currently open and active.
+ * We use a heartbeat from MapScreen.tsx because AppState is often
+ * unreliable when checked from within a background task.
+ */
+const isAppInForeground = async (): Promise<boolean> => {
+    try {
+        const lastHeartbeat = await AsyncStorage.getItem(LAST_FOREGROUND_HEARTBEAT);
+        if (!lastHeartbeat) return false;
+        
+        const diff = Date.now() - parseInt(lastHeartbeat, 10);
+        // If the app sent a heartbeat in the last 15 seconds, consider it active
+        return diff < 15000;
+    } catch (e) {
+        return false;
+    }
 };
 
 // --- Sync Logic ---
 
 export const syncLocationQueue = async () => {
+    // 1. Prevent overlapping syncs
+    if (isSyncInProgress) return;
+    
+    // 2. Only run background sync if app is NOT active
+    // Foreground updates are handled by MapScreen.tsx
+    if (await isAppInForeground()) {
+        return;
+    }
+
+    // 3. Throttle background syncs to 10 seconds
+    const lastSyncStr = await AsyncStorage.getItem(LAST_BACKGROUND_SYNC_TIME);
+    const lastSync = lastSyncStr ? parseInt(lastSyncStr, 10) : 0;
+    if (Date.now() - lastSync < 10000) {
+        return;
+    }
+
     const state = await NetInfo.fetch();
     if (!state.isConnected) {
-        console.log('Offline: Skipping sync.');
         return;
     }
 
-    const queue = await getQueue();
-    if (queue.length === 0) return;
+    isSyncInProgress = true;
+    try {
+        const queue = await getQueue();
+        if (queue.length === 0) return;
 
-    console.log(`Syncing ${queue.length} locations...`);
+        // Clear queue immediately to prevent other triggers from seeing these items
+        await saveQueue([]);
 
-    const remainingQueue: LocationData[] = [];
+        const circleId = await AsyncStorage.getItem("mapScreen:lastSelectedCircleId");
+        if (!circleId) {
+            // Put items back if we can't sync
+            await saveQueue(queue);
+            return;
+        }
 
-    const circleId = await AsyncStorage.getItem("mapScreen:lastSelectedCircleId");
-    const isDriveDetectionEnabled = (await AsyncStorage.getItem("user_drive_detection_enabled")) === "true";
+        const remainingQueue: LocationData[] = [];
+        await AsyncStorage.setItem(LAST_BACKGROUND_SYNC_TIME, Date.now().toString());
 
-    if (!circleId) {
-        console.warn("No circle ID found for background update. Aborting sync.");
-        return;
-    }
+        for (const loc of queue) {
+            try {
+                const response = await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        accept: "application/json",
+                    },
+                    body: JSON.stringify({
+                        latitude: loc.latitude,
+                        longitude: loc.longitude,
+                        name: "Background Update from front end",
+                        metadata: {
+                            run: 'background',
+                            time: formatToSLTime(loc.timestamp),
+                        }
+                    })
+                });
 
-    for (const loc of queue) {
-        try {
-            // Check drive detection setting
-            const isDriveEnabled = (await AsyncStorage.getItem("user_drive_detection_enabled")) === "true";
-            
-            const response = await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    accept: "application/json",
-                },
-                body: JSON.stringify({
-                    latitude: loc.latitude,
-                    longitude: loc.longitude,
-                    name: "Background Update from front end",
-                    metadata: {
-                        speed: isDriveDetectionEnabled ? String(Math.round(loc.speed ?? 0)) : "0"
-                   }
-                })
-            });
-
-            if (!response.ok) {
-                console.warn("Failed to sync location:", await response.text());
+                if (!response.ok) {
+                    remainingQueue.push(loc);
+                }
+            } catch (error) {
                 remainingQueue.push(loc);
             }
-        } catch (error) {
-            console.error("Sync error:", error);
-            remainingQueue.push(loc);
         }
-    }
 
-    await saveQueue(remainingQueue);
+        // Put failed items back in the queue
+        if (remainingQueue.length > 0) {
+            const currentQueue = await getQueue();
+            await saveQueue([...remainingQueue, ...currentQueue]);
+        }
+    } finally {
+        isSyncInProgress = false;
+    }
 };
 
 // --- Background Task (Android) ---
@@ -122,6 +181,11 @@ const backgroundTask = async (taskDataArguments?: { delay: number }) => {
                     // distanceInterval: 20,
                 },
                 async (location) => {
+                    // Inhibition: Do not collect background points if app is open
+                    if (await isAppInForeground()) {
+                        return;
+                    }
+
                     const locData: LocationData = {
                         latitude: location.coords.latitude,
                         longitude: location.coords.longitude,
@@ -151,7 +215,7 @@ const backgroundTask = async (taskDataArguments?: { delay: number }) => {
 
             // Loop to keep service alive
             while (BackgroundService.isRunning()) {
-                await sleep(5000);
+                await sleep(10000);
             }
 
         } catch (e) {
@@ -175,7 +239,7 @@ const options = {
     color: '#ff00ff',
     linkingURI: 'yourSchemeHere://chat/jane',
     parameters: {
-        delay: 30000,
+        delay: 10000,
     },
 };
 
@@ -187,6 +251,11 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
         return;
     }
     if (data) {
+        // Inhibition: Do not collect background points if app is open
+        if (await isAppInForeground()) {
+            return;
+        }
+
         const { locations } = data as { locations: Location.LocationObject[] };
         const location = locations[0];
         if (!location) return;

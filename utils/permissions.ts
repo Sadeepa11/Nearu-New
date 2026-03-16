@@ -5,9 +5,9 @@ import { PermissionsAndroid, Platform } from 'react-native';
 import { authenticatedFetch } from './auth';
 
 
-const API_BASE_URL = "https://api.medi.lk/api";
+// const API_BASE_URL = "https://api.medi.lk/api";
 // const API_BASE_URL = "https://nearu.servefamily.com/api";
-// const API_BASE_URL = "https://nearu.kalametiyaseafoodrestaurant.com/api";
+const API_BASE_URL = "https://nearu.kalametiyaseafoodrestaurant.com/api";
 
 // const API_BASE_URL = "https://nearu.servefamily.com/api";
 
