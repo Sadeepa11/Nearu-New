@@ -589,8 +589,9 @@ interface LocationUpdatePayload {
 
 const maybePostCircleLocationUpdate = async (
   circleIdLike: unknown,
-  coords: LocationUpdatePayload
-): Promise<{ success: boolean; name: string | null }> => {
+  coords: LocationUpdatePayload,
+  force: boolean = false
+): Promise<{ success: boolean; name: string | null; data?: any[] }> => {
   const circleId = normalizeIdentifier(circleIdLike);
   if (!circleId) {
     return { success: false, name: null };
@@ -612,7 +613,7 @@ const maybePostCircleLocationUpdate = async (
 
   // Throttle updates to prevent duplicate calls (8-second window for 10s interval)
   const lastPosted = await getLastPostedLocationForCircle(circleId);
-  if (lastPosted && Date.now() - lastPosted.timestamp < 8000) {
+  if (!force && lastPosted && Date.now() - lastPosted.timestamp < 8000) {
     console.log("Throttled: Skipping location update.");
     // Return mock success so the caller thinks it went through and won't aggressively retry
     return { success: true, name: "Throttled" };
@@ -657,7 +658,7 @@ const maybePostCircleLocationUpdate = async (
   // Check drive detection setting
   const isDriveDetectionEnabled = (await AsyncStorage.getItem("user_drive_detection_enabled")) === "true";
 
-  const response = await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
+  const response = await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/live-location`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -667,20 +668,19 @@ const maybePostCircleLocationUpdate = async (
       latitude,
       longitude,
       name: realLocationName,
-      metadata: {
-        run: 'foreground',
-        time: formatToSLTime(new Date()),
-        // speed: isDriveDetectionEnabled ? String(coords.speed) : "0"
-      },
+      speed:"0",
+      run: 'foreground',
+      time: formatToSLTime(new Date()),
+      // speed: isDriveDetectionEnabled ? String(coords.speed) : "0"
     }),
   });
 
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
     throw new Error(payload?.message ?? "Failed to post location update.");
   }
 
-  return { success: true, name: realLocationName };
+  return { success: true, name: realLocationName, data: payload?.data };
 };
 
 // Background task registration moved to services/BackgroundLocationService.ts
@@ -2900,115 +2900,82 @@ const MapScreen: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const fetchCircleLiveStatus = useCallback(async (circleId: number | string | undefined) => {
-    if (!circleId) return;
-    const circleIdParam = String(circleId);
+  const handleLiveStatusUpdate = useCallback((liveData: any[]) => {
+    if (!Array.isArray(liveData)) return;
 
-    try {
-      const response = await authenticatedFetch(`${API_BASE_URL}/circles/${circleIdParam}/live-status`, {
-        headers: { accept: "application/json" },
+    // 1. Update Member Locations - skip coords if 'same'
+    setMemberLocations(prev => {
+      const next = { ...prev };
+      let anyChanged = false;
+      liveData.forEach(m => {
+        const mid = String(m.id);
+        const existing = prev[mid];
+
+        // If same, we keep existing lat/lng but might still update speed/battery
+        const latitude = m.locationChange === 'same' && existing ? existing.latitude : m.latitude;
+        const longitude = m.locationChange === 'same' && existing ? existing.longitude : m.longitude;
+
+        if (
+          !existing ||
+          existing.latitude !== latitude ||
+          existing.longitude !== longitude ||
+          existing.speed !== m.speed ||
+          existing.battery !== m.battery
+        ) {
+          next[mid] = {
+            latitude,
+            longitude,
+            heading: undefined,
+            accuracy: null,
+            speed: m.speed,
+            battery: m.battery,
+          };
+          anyChanged = true;
+        }
       });
+      return anyChanged ? next : prev;
+    });
 
-      if (!response.ok) {
-        return;
-      }
-
-      const payload = await response.json();
-      const liveData = payload?.data;
-      console.log("liveData", liveData);
-
-      if (!Array.isArray(liveData)) return;
-
-      // 1. Update Member Locations - skip coords if 'same'
-      setMemberLocations(prev => {
-        const next = { ...prev };
-        let anyChanged = false;
-        liveData.forEach(m => {
-          const mid = String(m.id);
-          const existing = prev[mid];
-
-          // If same, we keep existing lat/lng but might still update speed/battery
-          const latitude = m.locationChange === 'same' && existing ? existing.latitude : m.latitude;
-          const longitude = m.locationChange === 'same' && existing ? existing.longitude : m.longitude;
-
-          if (
-            !existing ||
-            existing.latitude !== latitude ||
-            existing.longitude !== longitude ||
-            existing.speed !== m.speed ||
-            existing.battery !== m.battery
-          ) {
-            next[mid] = {
-              latitude,
-              longitude,
-              heading: undefined,
-              accuracy: null,
-              speed: m.speed,
-              battery: m.battery,
-            };
-            anyChanged = true;
-          }
-        });
-        return anyChanged ? next : prev;
+    // 2. Update Avatar URLs if changed
+    setMemberAvatarUrls(prev => {
+      const next = { ...prev };
+      let anyChanged = false;
+      liveData.forEach(m => {
+        const mid = String(m.id);
+        if (m.avatar && prev[mid] !== m.avatar) {
+          next[mid] = m.avatar;
+          anyChanged = true;
+        }
       });
+      return anyChanged ? next : prev;
+    });
 
-      // 2. Update Avatar URLs if changed
-      setMemberAvatarUrls(prev => {
-        const next = { ...prev };
-        let anyChanged = false;
-        liveData.forEach(m => {
-          const mid = String(m.id);
-          if (m.avatar && prev[mid] !== m.avatar) {
-            next[mid] = m.avatar;
+    // 3. Update Member Data if changed & Sort
+    setSelectedCircleMembers(prev => {
+      const nextMembers = [...prev];
+      let anyChanged = false;
+
+      liveData.forEach(update => {
+        const mid = String(update.id);
+        const index = nextMembers.findIndex(m => resolveMemberId(m) === mid);
+
+        if (index !== -1) {
+          const member = nextMembers[index];
+          const hasInfoChanged =
+            member.name !== update.name ||
+            member.avatar !== update.avatar ||
+            (member as any).status !== update.status ||
+            (member as any).locationText !== update.locationText ||
+            (member as any).battery !== update.battery ||
+            (member as any).speed !== update.speed ||
+            (member as any).role !== update.role ||
+            (member as any).isTracker !== update.isTracker ||
+            (member as any).isMe !== update.isMe;
+
+          if (hasInfoChanged) {
             anyChanged = true;
-          }
-        });
-        return anyChanged ? next : prev;
-      });
-
-      // 3. Update Member Data if changed & Sort
-      setSelectedCircleMembers(prev => {
-        const nextMembers = [...prev];
-        let anyChanged = false;
-
-        liveData.forEach(update => {
-          const mid = String(update.id);
-          const index = nextMembers.findIndex(m => resolveMemberId(m) === mid);
-
-          if (index !== -1) {
-            const member = nextMembers[index];
-            const hasInfoChanged =
-              member.name !== update.name ||
-              member.avatar !== update.avatar ||
-              (member as any).status !== update.status ||
-              (member as any).locationText !== update.locationText ||
-              (member as any).battery !== update.battery ||
-              (member as any).speed !== update.speed ||
-              (member as any).role !== update.role ||
-              (member as any).isTracker !== update.isTracker ||
-              (member as any).isMe !== update.isMe;
-
-            if (hasInfoChanged) {
-              anyChanged = true;
-              nextMembers[index] = {
-                ...member,
-                name: update.name,
-                avatar: update.avatar,
-                status: update.status,
-                locationText: update.locationText,
-                lastSeen: update.lastSeen,
-                isMe: update.isMe,
-                role: update.role,
-                isTracker: update.isTracker,
-                battery: update.battery,
-                speed: update.speed,
-              } as any;
-            }
-          } else {
-            // Member not found in state, add it
-            anyChanged = true;
-            nextMembers.push({
-              id: update.id,
+            nextMembers[index] = {
+              ...member,
               name: update.name,
               avatar: update.avatar,
               status: update.status,
@@ -3019,36 +2986,69 @@ const MapScreen: React.FC = () => {
               isTracker: update.isTracker,
               battery: update.battery,
               speed: update.speed,
-            } as any);
+            } as any;
           }
-        });
-
-        if (!anyChanged) {
-          // Even if no data changed, we might want to check the sort if this is the first poll
-          // But usually we just return prev.
-          // Let's enforce sort if it's the first time we see isMe
-          const isSorted = nextMembers.length > 0 && ((nextMembers[0] as any).isMe || resolveMemberId(nextMembers[0]) === currentUserId);
-          if (isSorted) return prev;
+        } else {
+          // Member not found in state, add it
+          anyChanged = true;
+          nextMembers.push({
+            id: update.id,
+            name: update.name,
+            avatar: update.avatar,
+            status: update.status,
+            locationText: update.locationText,
+            lastSeen: update.lastSeen,
+            isMe: update.isMe,
+            role: update.role,
+            isTracker: update.isTracker,
+            battery: update.battery,
+            speed: update.speed,
+          } as any);
         }
-
-        // Sort: isMe first, then name
-        return nextMembers.sort((a, b) => {
-          const aId = resolveMemberId(a);
-          const bId = resolveMemberId(b);
-          const aMe = (a as any).isMe || aId === currentUserId;
-          const bMe = (b as any).isMe || bId === currentUserId;
-          if (aMe && !bMe) return -1;
-          if (!aMe && bMe) return 1;
-          const aName = a.name || "";
-          const bName = b.name || "";
-          return aName.localeCompare(bName);
-        });
       });
 
+      if (!anyChanged) {
+        // Enforce sort if it's the first time we see isMe
+        const isSorted = nextMembers.length > 0 && ((nextMembers[0] as any).isMe || resolveMemberId(nextMembers[0]) === currentUserId);
+        if (isSorted) return prev;
+      }
+
+      // Sort: isMe first, then name
+      return nextMembers.sort((a, b) => {
+        const aId = resolveMemberId(a);
+        const bId = resolveMemberId(b);
+        const aMe = (a as any).isMe || aId === currentUserId;
+        const bMe = (b as any).isMe || bId === currentUserId;
+        if (aMe && !bMe) return -1;
+        if (!aMe && bMe) return 1;
+        const aName = a.name || "";
+        const bName = b.name || "";
+        return aName.localeCompare(bName);
+      });
+    });
+  }, [currentUserId]);
+
+  const fetchCircleLiveStatus = useCallback(async (circleId: number | string | undefined) => {
+    if (!circleId) return;
+    const circleIdParam = String(circleId);
+    const lastLoc = locationRef.current;
+    if (!lastLoc) return;
+
+    try {
+      // Use maybePostCircleLocationUpdate with force=true to bypass throttle and get fresh data
+      const result = await maybePostCircleLocationUpdate(circleIdParam, {
+        latitude: lastLoc.latitude,
+        longitude: lastLoc.longitude,
+        speed: currentSpeed,
+      }, true);
+
+      if (result.success && result.data) {
+        handleLiveStatusUpdate(result.data);
+      }
     } catch (e) {
-      console.warn("Failed to poll live status:", e);
+      console.warn("Failed to fetch circle live status:", e);
     }
-  }, []);
+  }, [handleLiveStatusUpdate, currentSpeed]);
 
   // Poll for circle live status every 5 minutes
   useEffect(() => {
@@ -3334,6 +3334,7 @@ const MapScreen: React.FC = () => {
       // Always fetch fresh member data to ensure we have the latest locations
       // This fixes an issue where the initial list might lack current locations
       fetchCircleMembers(found.id);
+      fetchCircleLiveStatus(found.id);
 
       await AsyncStorage.setItem(STORAGE_KEYS.lastSelectedCircleId, String(found.id)).catch(() => undefined);
 
@@ -3360,7 +3361,7 @@ const MapScreen: React.FC = () => {
         }
       }
     },
-    [currentUserId, fetchCircleMembers]
+    [currentUserId, fetchCircleMembers, fetchCircleLiveStatus]
   );
 
   const fetchCircleLocations = useCallback(async (circleId: number | string | undefined) => {
@@ -3942,8 +3943,9 @@ const MapScreen: React.FC = () => {
     };
   }, []);
 
+  // Consolidated background/foreground heartbeat and location reporting logic
   useEffect(() => {
-    let interval: any;
+    let heartbeatInterval: any;
 
     const sendHeartbeat = async () => {
       try {
@@ -3957,64 +3959,10 @@ const MapScreen: React.FC = () => {
     void sendHeartbeat();
 
     // Send heartbeat every 10 seconds
-    interval = setInterval(() => {
-      void sendHeartbeat();
-    }, 10000);
+    heartbeatInterval = setInterval(sendHeartbeat, 10000);
 
     return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, []);
-
-  // --- Simple 10s Foreground Reporting Loop ---
-  useEffect(() => {
-    let interval: any;
-
-    const syncLocationDirectly = async () => {
-      try {
-        const circleId = activeCircleIdRef.current;
-        const lastLoc = locationRef.current;
-        if (!circleId || !lastLoc) return;
-
-        // Fetch location name (with small cache logic or just OSM)
-        const locationName = await getLocationNameFromOSM(lastLoc.latitude, lastLoc.longitude);
-
-        const payload = {
-          latitude: lastLoc.latitude,
-          longitude: lastLoc.longitude,
-          name: locationName,
-          metadata: {
-            run: 'foreground',
-            time: formatToSLTime(new Date()),
-          },
-        };
-
-        await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            accept: "application/json",
-          },
-          body: JSON.stringify(payload),
-        });
-
-        // alert("API called: " + JSON.stringify(payload));
-        console.log("Simple 10s API sync successful");
-      } catch (err) {
-        console.warn("Simple 10s sync failed:", err);
-      }
-    };
-
-    // Immediate sync on mount
-    void syncLocationDirectly();
-
-    // Standard 10s interval
-    interval = setInterval(() => {
-      void syncLocationDirectly();
-    }, 10000);
-
-    return () => {
-      if (interval) clearInterval(interval);
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
     };
   }, []);
 
@@ -4069,14 +4017,18 @@ const MapScreen: React.FC = () => {
                 latitude,
                 longitude,
                 accuracy: position.coords.accuracy ?? null,
-                speed: position.coords.speed !== null ? position.coords.speed : null,   //Test Case 4
+                speed: position.coords.speed !== null ? position.coords.speed : null,
               }).then((result) => {
+                if (result.success && result.data) {
+                  handleLiveStatusUpdate(result.data);
+                }
+                
                 // Show auto-closing coordinate alert with full details
                 setCoordinateAlert({
                   visible: true,
                   lat: latitude,
                   lng: longitude,
-                  speed: position.coords.speed !== null ? position.coords.speed : null, // Store as kmph to match UI logic
+                  speed: position.coords.speed !== null ? position.coords.speed : null,
                   accuracy: position.coords.accuracy ?? null,
                   name: result.name,
                 });

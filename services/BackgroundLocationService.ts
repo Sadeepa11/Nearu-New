@@ -197,7 +197,7 @@ export const syncLocationQueue = async () => {
                 // Fetch location name (with small cache logic or just OSM)
                 const locationName = await getLocationNameFromOSM(loc.latitude, loc.longitude);
 
-                await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/location`, {
+                await authenticatedFetch(`${API_BASE_URL}/profile/circles/${circleId}/live-location`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -207,10 +207,9 @@ export const syncLocationQueue = async () => {
                         latitude: loc.latitude,
                         longitude: loc.longitude,
                         name: locationName,
-                        metadata: {
-                            run: 'background',
-                            time: formatToSLTime(loc.timestamp),
-                        },
+                        speed:"0",
+                        run: 'background',
+                        time: formatToSLTime(loc.timestamp),
                     }),
                 });
             } catch (error) {
